@@ -110,7 +110,8 @@
 *                           chanage api crc32() -> rtk_crc32()
 *                           chanage api crc24q() -> rtk_crc24q()
 *-----------------------------------------------------------------------------*/
-#define _POSIX_C_SOURCE 199309
+// #define _POSIX_C_SOURCE 199309
+#define _POSIX_C_SOURCE 199506
 #include <stdarg.h>
 #include <ctype.h>
 #ifndef WIN32
