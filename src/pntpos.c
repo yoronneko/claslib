@@ -19,8 +19,6 @@
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
-static const char rcsid[]="$Id:$";
-
 /* constants -----------------------------------------------------------------*/
 
 #define SQR(x)      ((x)*(x))
@@ -204,18 +202,21 @@ static int rescode(int iter, const obsd_t *obs, int n, const double *rs,
 {
     double r,dion,dtrp,vmeas,vion,vtrp,rr[3],pos[3],dtr,e[3],P,lam_L1;
     int i,j,nv=0,sys,mask[4]={0};
+    obsd_t *obs_ex=NULL;
     
     trace(3,"resprng : n=%d\n",n);
     
-    for (i=0;i<3;i++) rr[i]=x[i]; dtr=x[3];
+    for (i=0;i<3;i++) { rr[i]=x[i]; } dtr=x[3];
     
     ecef2pos(rr,pos);
+    
+    if (!(obs_ex=(obsd_t *)malloc(sizeof(obsd_t)*n))) return 0;
     
     for (i=*ns=0;i<n&&i<MAXOBS;i++) {
         vsat[i]=0; azel[i*2]=azel[1+i*2]=resp[i]=0.0;
         
-		if (outp[obs[i].sat-1]==1) continue;
-		
+        if (outp[obs[i].sat-1]==1) continue;
+        
         if (!(sys=satsys(obs[i].sat,NULL))) continue;
         
         /* reject duplicated observation data */
@@ -229,11 +230,12 @@ static int rescode(int iter, const obsd_t *obs, int n, const double *rs,
         if ((r=geodist(rs+i*6,rr,e))<=0.0||
             satazel(pos,e,azel+i*2)<opt->elmin) continue;
         
-        /* psudorange with code bias correction */
-        if ((P=prange(obs+i,nav,azel+i*2,iter,opt,&vmeas))==0.0) continue;
+        /* excluded satellite & signal */
+        obs_ex[i]=obs[i];
+        if (satsigexclude(&obs_ex[i],svh[i],opt)) continue;
         
-        /* excluded satellite? */
-        if (satexclude(obs[i].sat,svh[i],opt)) continue;
+        /* psudorange with code bias correction */
+        if ((P=prange(obs_ex+i,nav,azel+i*2,iter,opt,&vmeas))==0.0) continue;
         
         /* ionospheric corrections */
         if (!ionocorr(obs[i].time,nav,obs[i].sat,pos,azel+i*2,
@@ -275,6 +277,7 @@ static int rescode(int iter, const obsd_t *obs, int n, const double *rs,
         for (j=0;j<NX;j++) H[j+nv*NX]=j==i+3?1.0:0.0;
         var[nv++]=0.01;
     }
+    free(obs_ex);
     return nv;
 }
 /* validate solution ---------------------------------------------------------*/
@@ -309,25 +312,25 @@ static int valsol(const double *azel, const int *vsat, int n,
 }
 /* exclude large res satelite */
 static void exclsat(const obsd_t *obs, const double *resp, const prcopt_t *opt,
-					const int n, const int *vsat, int *outp)
+                    const int n, const int *vsat, int *outp)
 {
-	int i,j;
-	double v2=0.0;
-	double thre=(opt->rejethres*opt->rejethres);
-	
-	for (i=j=0;i<n;i++) {
-		if (vsat[i]==0) continue;
-		v2+=(resp[i]*resp[i]);
-		j++;
-	}
-	if (j==0||(v2/j)>thre) return;
-	for (i=0;i<n;i++){
-		if ((resp[i]*resp[i])>thre) {
-			outp[obs[i].sat-1]=1;	
-			trace(2,"pntpos : excluded obs due to large residuals :sat=%2d res=%.2f avg=%f\n",
-			obs[i].sat,resp[i],sqrt(v2/j));
-		}	
-	}
+    int i,j;
+    double v2=0.0;
+    double thre=(opt->rejethres*opt->rejethres);
+    
+    for (i=j=0;i<n;i++) {
+        if (vsat[i]==0) continue;
+        v2+=(resp[i]*resp[i]);
+        j++;
+    }
+    if (j==0||(v2/j)>thre) return;
+    for (i=0;i<n;i++){
+        if ((resp[i]*resp[i])>thre) {
+            outp[obs[i].sat-1]=1;
+            trace(2,"pntpos : excluded obs due to large residuals :sat=%2d res=%.2f avg=%f\n",
+            obs[i].sat,resp[i],sqrt(v2/j));
+        }    
+    }
 
 }
 /* estimate receiver position ------------------------------------------------*/
@@ -338,7 +341,7 @@ static int estpos(const obsd_t *obs, int n, const double *rs, const double *dts,
 {
     double x[NX]={0},dx[NX],Q[NX*NX],*v,*H,*var,sig;
     int i,j,k,info,stat,nv,ns;
-	int outp[MAXSAT]={0};
+    int outp[MAXSAT]={0};
     
     trace(3,"estpos  : n=%d\n",n);
     
@@ -583,11 +586,11 @@ extern int pntpos(const obsd_t *obs, int n, const nav_t *nav,
     rs=mat(6,n); dts=mat(2,n); var=mat(1,n); azel_=zeros(2,n); resp=mat(1,n);
     
     if (opt_.mode!=PMODE_SINGLE) { /* for precise positioning */
-		if (opt_.mode>=PMODE_PPP_RTK) {
-			opt_.sateph =EPHOPT_BRDC;
-			opt_.ionoopt=IONOOPT_IFLC;
-			opt_.tropopt=TROPOPT_SAAS;			 
-		} else {
+        if (opt_.mode>=PMODE_PPP_RTK) {
+            opt_.sateph =EPHOPT_BRDC;
+            opt_.ionoopt=IONOOPT_IFLC;
+            opt_.tropopt=TROPOPT_SAAS;
+        } else {
 #if 0
             opt_.sateph =EPHOPT_BRDC;
 #endif

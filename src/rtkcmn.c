@@ -122,8 +122,6 @@
 #endif
 #include "rtklib.h"
 
-static const char rcsid[]="$Id: rtkcmn.c,v 1.1 2008/07/17 21:48:06 ttaka Exp ttaka $";
-
 /* constants -----------------------------------------------------------------*/
 
 #define POLYCRC32   0xEDB88320u /* CRC32 polynomial */
@@ -199,16 +197,21 @@ const prcopt_t prcopt_default={ /* defaults processing options */
     {0},{0},{0},                /* baseline,ru,rb */
     {"",""},                    /* anttype */
     {{0}},{{0}},{0},            /* antdel,pcvr,exsats */
-    {{0}},{0},0,0,              /* rnxopt,posopt,syncsol,overlap */
+    {{0}},{0,0,0,0,0,0,0,0,0,0,0,0,2},0, /* rnxopt,posopt,syncsol */
     {{0.0}},{{0}},{""},         /* odisp,exterr,rectype */
     0,0,                        /* isb,phasshft */
     0.0,                        /* beta */
-    0,0                       /* L6 week, L6 dump */
+    0,0,                        /* L6 week, L6 dump */
+    0                           /* L6 2ch mode */
 };
 const solopt_t solopt_default={ /* defaults solution output options */
     SOLF_LLH,TIMES_GPST,1,3,    /* posf,times,timef,timeu */
     0,1,0,0,0,0,                /* degf,outhead,outopt,datum,height,geoid */
-    0,0,0,                      /* solstatic,sstat,trace */
+#ifdef ENA_SSR2OSR
+    0,0,0,1,                    /* solstatic,sstat,trace,osr */
+#else
+    0,0,0,0,                    /* solstatic,sstat,trace,osr */
+#endif
     {0.0,0.0},                  /* nmeaintv */
     " ",""                      /* separator/program name */
 };
@@ -502,6 +505,47 @@ extern int satexclude(int sat, int svh, const prcopt_t *opt)
     if (svh) {
         trace(3,"unhealthy satellite: sat=%3d svh=%02X\n",sat,svh);
         return 1;
+    }
+    return 0;
+}
+/* test excluded satellite & signal ------------------------------------------
+* test excluded satellite
+* args   : obsd_t *obs      IO  observation data
+*          int    svh       I   sv health flag
+*          prcopt_t *opt    I   processing options (NULL: not used)
+* return : status (1:excluded,0:not excluded)
+*-----------------------------------------------------------------------------*/
+extern int satsigexclude(obsd_t *obs, int svh, const prcopt_t *opt)
+{
+    int sys, sat;
+    sat=obs->sat;
+    sys=satsys(sat,NULL);
+    
+    
+    if (svh<0) return 1; /* ephemeris unavailable */
+    
+    if (opt) {
+        if (opt->exsats[sat-1]==1) return 1; /* excluded satellite */
+        if (opt->exsats[sat-1]==2) return 0; /* included satellite */
+        if (!(sys&opt->navsys)) return 1; /* unselected sat sys */
+    }
+    if (svh && sys != SYS_QZS) {
+        trace(3,"unhealthy satellite: sat=%3d svh=%02X\n",sat,svh);
+        return 1;
+    } else if (svh&0x2C){
+        /* QZS L1C/A or L1C/B Health */
+        if (svh&0x20) {
+            obs->L[0]=0.0; obs->P[0]=0.0;
+        }
+        /* QZS L2C Health */
+        if (svh&0x08) {
+            obs->L[1]=0.0; obs->P[1]=0.0;
+        }
+        /* QZS L5 Health */
+        if (svh&0x04) {
+            obs->L[2]=0.0; obs->P[2]=0.0;
+        }
+        trace(3,"unhealthy qzss satellite: sat=%3d svh=%02X\n",sat,svh);
     }
     return 0;
 }
@@ -1047,7 +1091,7 @@ extern int matinv(double *A, int n)
     indx=imat(n,1); B=mat(n,n); matcpy(B,A,n,n);
     if (ludcmp(B,n,indx,&d)) {free(indx); free(B); return -1;}
     for (j=0;j<n;j++) {
-        for (i=0;i<n;i++) A[i+j*n]=0.0; A[j+j*n]=1.0;
+        for (i=0;i<n;i++) { A[i+j*n]=0.0; } A[j+j*n]=1.0;
         lubksb(B,n,indx,A+j*n);
     }
     free(indx); free(B);
@@ -1486,6 +1530,22 @@ static int filter2_(rtk_t *rtk, const double *x, const double *P,
     
     return info;
 }
+
+/* Kalman filter measurement update  ----------------------------------
+* args   : rtk_t   *rtk      I   rtk control/result struct
+*          double  *x        I/O float states
+*          double  *P        I/O error covariance matrix
+*          double  *Q        I/O process noise matrix[nx*nx]
+*          double  *H        I   measurement matrix
+*          double  *v        I   single differenced residual
+*          double  *R        I   measurement error matrix
+*          int     n         I   number of residual
+*          int     m         I   number of single differenced residual output
+*          int     *vflg     I   residuals infomation
+*          int     flg       I   (prefix:0 or postfix:1)
+* return : status of matinv function(inverse of matrix )
+* notes  : 
+*-----------------------------------------------------------------------------*/
 extern int filter2(rtk_t *rtk, double *x, double *P, double *Q, const double *H,
                    const double *v, const double *R, const int n,
                    const int m, const int *vflg, const int flg)
@@ -1581,7 +1641,7 @@ extern double str2num(const char *s, int i, int n)
     char str[256],*p=str;
     
     if (i<0||(int)strlen(s)<i||(int)sizeof(str)-1<n) return 0.0;
-    for (s+=i;*s&&--n>=0;s++) *p++=*s=='d'||*s=='D'?'E':*s; *p='\0';
+    for (s+=i;*s&&--n>=0;s++) { *p++=*s=='d'||*s=='D'?'E':*s; } *p='\0';
     return sscanf(str,"%lf",&value)==1?value:0.0;
 }
 /* string to time --------------------------------------------------------------
@@ -1597,7 +1657,7 @@ extern int str2time(const char *s, int i, int n, gtime_t *t)
     char str[256],*p=str;
     
     if (i<0||(int)strlen(s)<i||(int)sizeof(str)-1<i) return -1;
-    for (s+=i;*s&&--n>=0;) *p++=*s++; *p='\0';
+    for (s+=i;*s&&--n>=0;) { *p++=*s++; } *p='\0';
     if (sscanf(str,"%lf %lf %lf %lf %lf %lf",ep,ep+1,ep+2,ep+3,ep+4,ep+5)<6)
         return -1;
     if (ep[0]<100.0) ep[0]+=ep[0]<80.0?2000.0:1900.0;
@@ -2460,7 +2520,7 @@ static int readantex(const char *file, pcvs_t *pcvs)
 {
     FILE *fp;
     static const pcv_t pcv0={0};
-    pcv_t pcv;
+    pcv_t pcv={0};
     double neu[3];
     int i,f,freq=0,state=0,freqs[]={1,2,5,6,7,8,0};
     char buff[256];
@@ -3962,7 +4022,7 @@ static int get_mops(const double lat, const double doy,double *pre, double *temp
 {
     int i;
     double cos_,latdeg=lat*R2D;  /* rad->deg */
-    const double dminN = 28,DminS = 211; /* 28@north hemisphere, 211@south hemisphere */
+    const double dminN = 28; /* 28@north hemisphere */
     const double interval[]= {15.0,30.0,45.0,60.0,75.0};
 
     /*Meteorological parameter Average table */

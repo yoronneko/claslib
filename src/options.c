@@ -19,8 +19,6 @@
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
-static const char rcsid[]="$Id:$";
-
 /* system options buffer -----------------------------------------------------*/
 static prcopt_t prcopt_;
 static solopt_t solopt_;
@@ -87,6 +85,7 @@ opt_t sysopts[]={
     {"pos1-posopt10",   3,  (void *)&prcopt_.posopt[9],  SWTOPT },
     {"pos1-posopt11",   3,  (void *)&prcopt_.posopt[10], FRQOPT2},
     {"pos1-posopt12",   3,  (void *)&prcopt_.posopt[11], SWTOPT },
+    {"pos1-posopt13",   3,  (void *)&prcopt_.posopt[12], FRQOPT2 },
     {"pos1-exclsats",   2,  (void *)exsats_,             "prn ..."},
     {"pos1-navsys",     0,  (void *)&prcopt_.navsys,     NAVOPT },
     {"pos1-gridsel",    0,  (void *)&prcopt_.gridsel,    "m"    },
@@ -125,7 +124,6 @@ opt_t sysopts[]={
     {"pos2-rejgdop",    1,  (void *)&prcopt_.maxgdop,    ""     },
     {"pos2-niter",      0,  (void *)&prcopt_.niter,      ""     },
     {"pos2-netnum",     0,  (void *)&prcopt_.netnum,     ""     },
-    {"pos2-overlap",    3,  (void *)&prcopt_.overlap,    SWTOPT },
     {"pos2-baselen",    1,  (void *)&prcopt_.baseline[0],"m"    },
     {"pos2-basesig",    1,  (void *)&prcopt_.baseline[1],"m"    },
     {"pos2-forgetion",  1,  (void *)&prcopt_.forgetion,  ""     },

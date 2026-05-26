@@ -35,14 +35,16 @@ static const char *help[]={
 ""
 " Read RINEX OBS/NAV, QZSS L6 MESSAGE(.l6) files and compute",
 " receiver (rover) positions and output position solutions.",
-" -?        print help",
-" -k file   input options from configuration file [off]",
-" -ti tint  time interval (sec) [all]",
-" -ts ds ts start day/time (ds=y/m/d ts=h:m:s) [obs start time]",
-" -te de te end day/time   (de=y/m/d te=h:m:s) [obs end time]",
-" -l6w      specify GPS week corresponding to the start time of .l6 file [obs start time]",
-" -o file   set output file [NMEA-GGA]",
-" -x level  debug trace level (0:off) [0]"
+" -?           print help",
+" -k file      input options from configuration file [off]",
+" -ti tint     time interval (sec) [all]",
+" -ts ds ts    start day/time (ds=y/m/d ts=h:m:s) [obs start time]",
+" -te de te    end day/time   (de=y/m/d te=h:m:s) [obs end time]",
+" -l6w         specify GPS week corresponding to the start time of .l6 file [obs start time]",
+" -o file      set output file [NMEA-GGA]",
+" -x level     debug trace level (0:off) [0]",
+" -s           set output osrfile [off]",
+" -l6msg mode  L6 message 2ch mode (0:off,1:on) [0]"
 };
 /* show message --------------------------------------------------------------*/
 extern int showmsg(char *format, ...)
@@ -71,7 +73,7 @@ int main(int argc, char **argv)
     gtime_t ts={0},te={0};
     double tint=0.0,es[]={2000,1,1,0,0,0},ee[]={2000,12,31,23,59,59};
     int i,n,ret;
-    char *infile[MAXFILE],*outfile="rnx2rtkp";
+    char *infile[MAXFILE],outfile[1024]="rnx2rtkp";
     
     prcopt.mode  =PMODE_PPP_RTK;
     prcopt.navsys=SYS_GPS|SYS_QZS;
@@ -90,7 +92,7 @@ int main(int argc, char **argv)
         }
     }
     for (i=1,n=0;i<argc;i++) {
-        if      (!strcmp(argv[i],"-o")&&i+1<argc) outfile=argv[++i];
+        if      (!strcmp(argv[i],"-o")&&i+1<argc) { strncpy(outfile, argv[++i], sizeof(outfile)-1); outfile[sizeof(outfile)-1]='\0'; }
         else if (!strcmp(argv[i],"-ts")&&i+2<argc) {
             sscanf(argv[++i],"%lf/%lf/%lf",es,es+1,es+2);
             sscanf(argv[++i],"%lf:%lf:%lf",es+3,es+4,es+5);
@@ -105,6 +107,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"-ti")&&i+1<argc) tint=atof(argv[++i]);
         else if (!strcmp(argv[i],"-k")&&i+1<argc) {++i; continue;}
         else if (!strcmp(argv[i],"-x")&&i+1<argc) solopt.trace=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"-s")&&i+1<argc) solopt.osr=1;
+        else if (!strcmp(argv[i],"-l6msg")&&i+1<argc) prcopt.l6mrg=atoi(argv[++i]);
         else if (*argv[i]=='-') printhelp();
         else if (n<MAXFILE) infile[n++]=argv[i];
     }

@@ -15,8 +15,6 @@
 *-----------------------------------------------------------------------------*/
 #include "rtklib.h"
 
-static const char rcsid[]="$Id: geoid.c,v 1.1 2008/07/17 21:48:06 ttaka Exp $";
-
 static const double range[4];       /* embedded geoid area range {W,E,S,N} (deg) */
 static const float geoid[361][181]; /* embedded geoid heights (m) (lon x lat) */
 static FILE *fp_geoid=NULL;         /* geoid file pointer */
@@ -51,7 +49,7 @@ static double geoidh_emb(const double *pos)
 /* get 2 byte signed integer from file ---------------------------------------*/
 static short fget2b(FILE *fp, long off)
 {
-    unsigned char v[2];
+    unsigned char v[2]="";
     if (fseek(fp,off,SEEK_SET)==EOF||fread(v,2,1,fp)<1) {
         trace(2,"geoid data file range error: off=%ld\n",off);
     }

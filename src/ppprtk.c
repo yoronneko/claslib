@@ -61,7 +61,11 @@
 #define MAXPBCORSSR 20.0            /* max phase bias correction of ssr (m) */
 #define CSSRINVALID -10000          /* invalid value */
 
-static const double sfi[4]={FREQ2/FREQ1,FREQ1/FREQ2,1.0-SQR(FREQ1/FREQ2),FREQ2/FREQ1-FREQ1/FREQ2};
+enum ddres_order {
+  FST = 1,
+  SND,
+  TRD
+};
 
 /*  The F inverse distribution function */
 static const double qf[6][60] = {
@@ -110,6 +114,7 @@ static const double qf[6][60] = {
 };
 
 extern FILE *fp_osr;
+extern void getsysprnstr(char *exsatstr, int exsat, char *comma_str);
 #ifdef CSSR2OSR_VRS
 static unsigned char obsfreqs[]={ /* 1:L1,2:L2,3:L5,4:L6,5:L7,6:L8,7:L3 */
     
@@ -181,31 +186,11 @@ static void initx(rtk_t *rtk, double xi, double var, int i)
         rtk->P[i+j*rtk->nx]=rtk->P[j+i*rtk->nx]=i==j?var:0.0;
     }
 }
-extern int selfreqpair(const int sat, const prcopt_t *opt,const obsd_t *obs)
-{
-    int optf=opt->posopt[10];
-    if (NFREQ==1||optf==POSL1) {
-         return 0;
-    }else {
-        if ((satsys(sat,NULL))&(SYS_GAL)) {/* GAL */
-            if(obs->L[2]!=0.0||obs->P[2]!=0.0) return 2; 
-            return 0; 
-        }
-        if (optf==POSL1L2L5) return 1+2;
-        if (optf==POSL1L5) return 2;
-        if (optf==POSL1L5_L2&&obs->L[2]!=0.0&&obs->P[2]!=0.0) return 2;
-        if (optf==POSL1L2) {
-             if (obs->L[1]!=0.0||obs->P[1]!=0.0) return 1;
-             return 0;
-        }
-        return 1;
-    }
-}
 /* temporal update of position -----------------------------------------------*/
 static void udpos_ppp(rtk_t *rtk, const obsd_t *obs, int n,  double tt)
 {
     double *F,*FP,*xp,pos[3],Q[9]={0},Qv[9],var=0.0;
-    int i, j, na,nb,nx,flag_init=0;
+    int i, j, na,nb,nx;
     double *Fx,*Pxx,*Pxi,*Pxb,*Pxi_,*Pxb_,*xp_,ki;
     int ni;
     
@@ -226,7 +211,7 @@ static void udpos_ppp(rtk_t *rtk, const obsd_t *obs, int n,  double tt)
             for (i=3;i<6;i++) initx(rtk,rtk->sol.rr[i],VAR_VEL,i);
             for (i=6;i<9;i++) initx(rtk,1E-6,VAR_ACC,i);
         }
-        flag_init=1;
+        return;
     }
 
     /* check variance of estimated postion */
@@ -317,17 +302,12 @@ static void udpos_ppp(rtk_t *rtk, const obsd_t *obs, int n,  double tt)
         for (i=0;i<3;i++) for (j=0;j<3;j++) {
             rtk->P[i+6+(j+6)*nx]+=Qv[i+j*3];
         }
-        if (rtk->opt.prnadpt&&flag_init==0) {
-            for (i=0;i<9;i++) for (j=0;j<9;j++) {
-                rtk->P[i+j*nx]+=rtk->Q[i+j*nx]*fabs(tt);
-            }
-        }
     } else {
         /* process noise added to only position */
         Q[0]=Q[4]=SQR(rtk->opt.prn[5])*fabs(tt); Q[8]=SQR(rtk->opt.prn[6])*fabs(tt);
         ecef2pos(rtk->x,pos);
         covecef(pos,Q,Qv);
-        if (rtk->opt.prnadpt==0||flag_init) {
+        if (rtk->opt.prnadpt==0) {
             for (i=0;i<3;i++) for (j=0;j<3;j++) {
                 rtk->P[i+j*nx]+=Qv[i+j*3];
             }
@@ -380,6 +360,7 @@ static void udion(rtk_t *rtk, double tt, double bl, const obsd_t *obs, int ns)
         for (k=0;k<ns;k++) {
             if (obs[k].sat==i) break;
         }
+        if (ns == k) continue;
         m=selfreqpair(i,&rtk->opt,obs+k);
         for (f=0;f<rtk->opt.nf;f++) {
             if (f>0&&!(f&m)) continue;
@@ -656,23 +637,181 @@ static int test_sys(int sys, int m, int qzsmodear, int code)
     }
     return 0;
 }
-/* single-differenced phase/code residuals -----------------------------------*/
-extern int ddres(rtk_t *rtk, const nav_t *nav, const double *x,
-                 const double *P, const obsd_t *obs, double *y, double *e,
+/* check valid zero difference signal ---------------------------------------*/
+static int valid_zd_sig(rtk_t *rtk, const obsd_t *obs, const nav_t *nav, 
+                        double *y, int nf, int f, int i, int j, 
+                        int m, int sati, int *satj, int *sysi, int *sysj,
+                        double *lami, double *lamj)
+{
+    prcopt_t *opt=&rtk->opt;
+    int code, ff;
+
+    if (i==j) return 0;
+    *satj = obs[j].sat;
+    *sysi = rtk->ssat[sati-1].sys;
+    *sysj = rtk->ssat[*satj-1].sys;
+    code=rtk->ssat[obs[j].sat-1].code[f%nf];
+    if (!test_sys(*sysj,m,opt->qzsmodear,code)) return 0;
+    if (!validobs(j,f,nf,y)) return 0;
+
+    ff = f%nf;
+    *lami = nav->lam[sati-1][ff];
+    *lamj = nav->lam[*satj-1][ff];
+    if (*lami<=0.0 || *lamj<=0.0) return 0;
+
+    return 1;
+}
+/* set_init_pb() is created by copying the second half of the udbias_ppp() */
+void set_init_pb(rtk_t *rtk, const nav_t *nav, const obsd_t *obs, int n, int f, int satj)
+{
+    int i, j, isat;
+    double offset, lami, cp, pr;
+    double* bias;
+    bias = zeros(n, 1);
+
+    /* estimate approximate phase-bias by phase - code */
+    for (i = j = 0, offset = 0.0; i < n; i++) {
+        cp = obs[i].L[f];
+        pr = obs[i].P[f];
+        lami = nav->lam[obs[i].sat - 1][f];
+        if (cp == 0.0 || pr == 0.0 || lami == 0.0) continue;
+
+        bias[i] = cp * lami - pr;
+
+        /* offset = sum of (bias - phase-bias) for all valid sats in meters */
+        if (rtk->x[IB(obs[i].sat, f, &rtk->opt)] != 0.0) {
+            lami = nav->lam[obs[i].sat - 1][f];
+            offset += bias[i] - rtk->x[IB(obs[i].sat, f, &rtk->opt)] * lami;
+            j++;
+        }
+    }
+    rtk->com_bias = j > 0 ? offset / j : 0; /* save offset for initialization below */
+    /* set initial states of phase-bias */
+    for (i = 0; i < n; i++) {
+        isat = obs[i].sat;
+        if (isat != satj) continue;
+        if (bias[i] == 0.0) continue;
+        trace(3, "set initial states of phase-bias, sat=%2d f=%2d\n", obs[i].sat, f + 1);
+        lami = nav->lam[isat - 1][f];
+        initx(rtk, (bias[i] - rtk->com_bias) / lami, SQR(rtk->opt.std[0]), IB(obs[i].sat, f, &rtk->opt));
+        rtk->ssat[isat - 1].lock[f] = -rtk->opt.minlock;
+        rtk->ssat[isat - 1].pbreset[f] = 1;
+    }
+    free(bias);
+}
+/*----------------------------------------------------------------------------
+* generate list of string of the deleted satellite by PAR 
+* args   : char   *exsatstr  IO  a list of string of the deleted satellite 
+*          int    exsat      I   deleted satellite 
+*          int    comma_str  I   character of comma
+* return : none
+*-----------------------------------------------------------------------------*/
+extern void getsysprnstr(char *exsatstr, int exsat, char *comma_str)
+{
+    int prn;
+    char tmpstr[10]="";
+    switch (satsys(exsat, &prn)) {
+        case SYS_GPS: sprintf(tmpstr, "G%02d%s", prn, comma_str); break;
+        case SYS_GAL: sprintf(tmpstr, "E%02d%s", prn, comma_str); break;
+        case SYS_QZS: sprintf(tmpstr, "J%02d%s", prn, comma_str); break;
+        default: return;
+    }
+    strcat(exsatstr, tmpstr);
+}
+void trace_slct_ch( rtk_t *rtk, const obsd_t *obs, int n, int order, int pch, int samefac, int trace_level)
+{
+    prcopt_t *opt=&rtk->opt;
+    char ch0[1024], ch1[1024], temp[1024];
+    int num0, num1, nf=NF(opt), f, j, satj;
+
+    for (f=opt->mode>PMODE_DGPS?0:nf;f<nf;f++) { /* freq*(phase+code) */
+        if (order != TRD) break;
+        if (f==0) {
+            if (opt->l6mrg==1) {
+                trace(trace_level, "--- ch select list ---  time:%s pch:%d\n", time_str(obs[0].time,0), pch);
+            } else {
+                trace(trace_level, "--- ch select list ---  time:%s\n", time_str(obs[0].time,0));
+            }
+			if (opt->l6mrg) {
+                sprintf(temp, "ch0:%d, ch1:%d", get_current_cssr_facility(0), get_current_cssr_facility(1));
+			} else {
+                sprintf(temp, "ch0:%d", get_current_cssr_facility(0));
+			}
+            trace(trace_level, "l6mrg:%d, samefac:%d[%s]\n", opt->l6mrg, samefac, temp);
+        }
+        sprintf(ch0, "ch0[L%d]:", f+1);
+        sprintf(ch1, "ch1[L%d]:", f+1);
+        for (j=0,num0=0,num1=0;j<n;j++) {
+            satj = obs[j].sat;
+            if (rtk->ssat[satj-1].vsat[f] == 1) {
+                sprintf(temp, "%d, ", satj);
+                if (rtk->ssat[satj-1].vch[f] == 0) {
+                    getsysprnstr(ch0, satj, ","); num0++;
+                } else {
+                    getsysprnstr(ch1, satj, ","); num1++;
+                }
+            }    
+        }
+        sprintf(temp, "%s satnum=%d\n", ch0, num0); trace(trace_level, temp);
+        sprintf(temp, "%s satnum=%d\n", ch1, num1); trace(trace_level, temp);
+        trace(trace_level, "----------------------\n");
+    }
+}
+
+int check_same_fac(void)
+{
+    int i, fac[SSR_CH_NUM];
+
+    for (i=0;i<SSR_CH_NUM;i++) {
+        fac[i]=get_current_cssr_facility(i);
+    }
+
+    return (fac[0]==fac[1]);
+}
+
+/* single-differenced phase/code residuals  ----------------------------------
+* args   : rtk_t   *rtk      I   rtk control/result struct
+*          nav_t   *nav      I   navigation messages
+*          double  *x        I   float states[nx*1]
+*          double  *P        I   error covariance matrix[nx*nx]
+*          obsd_t  *obs      I   observation data for an epoch
+*                                obs[i].rcv=1:rover,2:reference
+*                                sorted by receiver and satellte
+*          double  *y        I   residuals[nv*1](nv=n*nf*2*3,n=number of observation data)
+*          double  *e        I   line-of-sight vector (ecef) 
+*          double  *azel     I   azimath/elevation[n*2](n=number of observation data)
+*          int     n         I   number of residual
+*          double  *v        O   single differenced residual[vn*1]
+*          double  *H        O   measurement matrix[nx*nv]
+*          double  *R        O   measurement error matrix[nv*nv]
+*          int     *vflg     O   residuals infomation
+*          int     niter     I   number of reference satellte loop
+*          int     pch       I   priority L6 channel
+*          int     order     I   order in which ppp_rtk_pos() are called
+* return : int     nv        number of single differenced residual output
+* notes  : 
+*-----------------------------------------------------------------------------*/
+extern int ddres(rtk_t *rtk, const nav_t *nav, double *x, double *pbslip[SSR_CH_NUM],
+                 const double *P, const obsd_t *obs, double *y[SSR_CH_NUM], double *e,
                  double *azel, int n, double *v, double *H, double *R,
-                 int *vflg, int niter)
+                 int *vflg, int niter, int pch, int order)
 {
     prcopt_t *opt=&rtk->opt;
     double pos[3],lami,lamj,*Ri,*Rj,*Hi=NULL;
     double *tropu,*im,*dtdxu,didxi=0.0,didxj=0.0,fi,fj;
     static int refsat[NFREQ*2*MAXREF*6+1]={0};
-    int i,j,k,m,l,f,ff,nv=0,nb[NFREQ*6*2+1]={0},b=0,sati,satj,sysi,sysj,nf=NF(opt);
-    int flg=0,code;
+    static int refsat2[NFREQ*2*6+1]={0};
+    int h,i,j,k,m,l,f,nv=0,nb[NFREQ*6*2+1]={0},b=0,sati,satj,sysi,sysj,nf=NF(opt);
+    int flg=0,code,ch=-1,sch,ch_sig_cnt[SSR_CH_NUM]={0},samefac=0,refsatch=-1;
+    int refchgflg;
+    static int use_ch[NFREQ][MAXSAT], pre_use_ch[NFREQ][MAXSAT];
 
     trace(3,"ddres   :niter=%2d nx=%d n=%d\n",niter,rtk->nx,n);
 
     im=mat(n,1);tropu=mat(n,1);dtdxu=mat(n,3);Ri=mat(n*nf*2*2,1);Rj=mat(n*nf*2*2,1);
     ecef2pos(x,pos);
+    memcpy(pre_use_ch, use_ch, sizeof(use_ch));
+    for(f=0; f<NFREQ; f++) for(i=0; i<MAXSAT; i++) use_ch[f][i]=-1;
 
     for (i=0;i<MAXSAT;i++) {
         for (j=0;j<NFREQ;j++) rtk->ssat[i].resp[j]=rtk->ssat[i].resc[j]= 0.0;
@@ -687,64 +826,137 @@ extern int ddres(rtk_t *rtk, const nav_t *nav, const double *x,
         }
     }
 
+    /* check if the same facility is used */
+    if (opt->l6mrg) samefac=check_same_fac();
+
     for (m=0;m<6;m++) { /* m=0:gps/qzs/sbs,1:glo,2:gal,3:bds,4:qzs */
         for (j=l=0;j<n;j++) {
             sati=obs[j].sat;
             code=rtk->ssat[obs[j].sat-1].code[1];
             if (!test_sys(rtk->ssat[sati-1].sys,m,opt->qzsmodear,code)) continue;
-            if (timediff(obs[0].time,nav->ssr[sati-1].t0[1])>=5.0) continue;
+            if (samefac) {
+                if (timediff(obs[0].time,nav->ssr_ch[0][sati-1].t0[1])>=5.0 &&
+                    timediff(obs[0].time,nav->ssr_ch[1][sati-1].t0[1])>=5.0) continue;
+            } else {
+                if (timediff(obs[0].time,nav->ssr_ch[0][sati-1].t0[1])>=5.0) continue;
+                if (opt->l6mrg&&timediff(obs[0].time,nav->ssr_ch[1][sati-1].t0[1])>=5.0) continue;
+            }
             l++;
         }
         for (f=opt->mode>PMODE_DGPS?0:nf;f<nf*2;f++) { /* freq*(phase+code) */
             /* search reference satellite with highest elevation */
-            for (i=-1,j=0;j<n;j++) {
-                flg=0;
-                sati = obs[j].sat;
-                sysi = rtk->ssat[sati-1].sys;
-                code=rtk->ssat[obs[j].sat-1].code[f%nf];
-                if (!test_sys(sysi,m,opt->qzsmodear,code)) continue;
-                if (niter>0) {
-                    for (k=0;k<niter;k++) {
-                        if (refsat[NFREQ*2*MAXREF*m+NFREQ*2*k+f]==sati) flg=1;
+            for(h=0,sch=-1,refchgflg=0,refsatch=-1; h<((opt->l6mrg&&!samefac)?SSR_CH_NUM:1); h++) {
+                for (i=-1,j=0;j<n;j++) {
+                    flg=0;
+                    sati = obs[j].sat;
+                    sysi = rtk->ssat[sati-1].sys;
+                    code=rtk->ssat[obs[j].sat-1].code[f%nf];
+                    if (!test_sys(sysi,m,opt->qzsmodear,code)) continue;
+                    if (niter>0) {
+                        for (k=0;k<niter;k++) {
+                            if (refsat[NFREQ*2*MAXREF*m+NFREQ*2*k+f]==sati) flg=1;
+                        }
+                        if (flg==1) continue;
                     }
-                    if (flg==1) continue;
+                    if (samefac || h==1) {
+                        /* refsat is selected from one side ch */ 
+                        if (!validobs(j,f,nf,y[0]) && !validobs(j,f,nf,y[1])) continue;
+                        ch=validobs(j,f,nf,y[0])?0:1;
+                        if (l>1&&(timediff(obs[0].time,nav->ssr_ch[ch][sati-1].t0[1])>=5.0)) continue;
+                    } else { /* h=0 || samefac==0 */
+                        /* select common refsat between 2ch */
+                        if (!validobs(j,f,nf,y[0])) continue;
+                        if (opt->l6mrg && !validobs(j,f,nf,y[1])) continue;
+                        if (l>1&&(timediff(obs[0].time,nav->ssr_ch[0][sati-1].t0[1])>=5.0)) continue;
+                        if (opt->l6mrg&&l>1&&(timediff(obs[0].time,nav->ssr_ch[1][sati-1].t0[1])>=5.0)) continue;
+                    }
+                    if (opt->qzsmodear==2&&opt->posopt[8]&&sysi==SYS_QZS) continue;
+                    if (i<0||azel[1+j*2]>=azel[1+i*2]) {
+                        i=j;
+                        if (samefac) refsatch = ch;
+                        if (h==1) sch = ch;
+                    }
                 }
-                if (!validobs(j,f,nf,y)) continue;
-                if (opt->qzsmodear==2&&opt->posopt[8]&&sysi==SYS_QZS) continue;
-                if (l>1&&(timediff(obs[0].time,nav->ssr[sati-1].t0[1])>=5.0)) continue;
-                if (i<0||azel[1+j*2]>=azel[1+i*2]) i=j;
+                if (i>=0) break;
             }
             if (i<0) continue;
 
             sati = obs[i].sat;
+            if (f<nf) use_ch[f][sati]=2; /* use_ch=2 means ref sat */
+            if (f<nf && refsat2[NFREQ*2*m+f]!=sati && refsat2[NFREQ*2*m+f]!=0) {
+                trace(2,"refsat changed2 %s L%d sat=%2d -> %2d\n",time_str(rtk->sol.time,0),
+                      f%nf+1,refsat2[NFREQ*2*m+f], sati);
+                refchgflg =1;
+            }
             refsat[NFREQ*2*MAXREF*m+NFREQ*2*niter+f]=sati;
+            refsat2[NFREQ*2*m+f]=sati;
             if (niter>0) {
                 trace(2,"refsat changed %s L%d sat=%2d -> %2d\n",time_str(rtk->sol.time,0),
                       f%nf+1,refsat[NFREQ*MAXREF*2*m+NFREQ*2*(niter-1)+f],
                       refsat[NFREQ*MAXREF*2*m+NFREQ*2*niter+f]);
             }
-            
+            if (f<nf) trace(4, "refsat m:%d L%d %s: %d niter:%d\n", m, f+1, time_str(rtk->sol.time,0), sati, niter);
+            if (f<nf && pbslip!=NULL) {
+                for (ch=0;ch<(opt->l6mrg?SSR_CH_NUM:1);ch++) {
+                    x[IB(sati,f,opt)] += pbslip[ch][IB(sati,f,opt)];
+                    pbslip[ch][IB(sati, f, opt)] = 0.0;
+                }
+            }
+
+            /* if the same system is used, refsat can use different ch */
+            if (opt->l6mrg && samefac) sch=-1;
+
             /* make single difference */
             for (j=0;j<n;j++) {
-                if (i==j) continue;
-                satj = obs[j].sat;
-                sysi = rtk->ssat[sati-1].sys;
-                sysj = rtk->ssat[satj-1].sys;
-                code=rtk->ssat[obs[j].sat-1].code[f%nf];
-                if (!test_sys(sysj,m,opt->qzsmodear,code)) continue;
-                if (!validobs(j,f,nf,y)) continue;
+                if (!opt->l6mrg) {
+                    ch=0;
+                    if (!valid_zd_sig(rtk, obs, nav, y[ch], nf, f, i, j, m, sati, &satj, &sysi, &sysj, &lami, &lamj)) continue;
+                } else if (sch==-1) {
+                    if (opt->l6mrg==1) {
+                        /* priority channel selection */
+                        ch=pch;
+                    } else {
+                        /* balanced channel selection */
+                        if (ch_sig_cnt[0] <= ch_sig_cnt[1]) ch=0; else ch=1;
+                    }
+                    if (!valid_zd_sig(rtk, obs, nav, y[ch], nf, f, i, j, m, sati, &satj, &sysi, &sysj, &lami, &lamj)) {
+                        ch = ch==1?0:1;
+                        if (!valid_zd_sig(rtk, obs, nav, y[ch], nf, f, i, j, m, sati, &satj, &sysi, &sysj, &lami, &lamj)) {
+                            continue;
+                        }
+                    }
+                } else {
+                    trace(2,"even though it is a clas 2ch case, refsat is selected from one side ch.(ch=%d).\n", sch);
+                    ch=sch;
+                    if (!valid_zd_sig(rtk, obs, nav, y[ch], nf, f, i, j, m, sati, &satj, &sysi, &sysj, &lami, &lamj)) continue;
+                }
+                if (f<nf) use_ch[f][satj]=ch;
 
-                ff = f%nf;
-                lami = nav->lam[sati-1][ff];
-                lamj = nav->lam[satj-1][ff];
-                if (lami<=0.0 || lamj<=0.0) continue;
+                if (order==FST && f<nf && opt->l6mrg && !samefac) {
+                    /* two case for reset the phase bias */                    
+                    /* (1) if the reference satellite is changed and the dependent satellite that */
+                    /*     has selected a different ch from the previous ch of the changed reference satellite is reset */
+                    /* (2) reset the satellite that selected a different channel from the previous one */
+                    if ((pre_use_ch[f][sati]!=ch && refchgflg) || (pre_use_ch[f][satj]!=ch)) {
+                        set_init_pb(rtk, nav, obs, n, f, satj);
+                    }
+                }
+                if (f<nf && pbslip!=NULL) {
+                    x[IB(satj,f,opt)] += pbslip[ch][IB(satj,f,opt)];
+                    pbslip[ch][IB(satj, f, opt)] = 0.0;
+                }
 
                 if (H) {
                     Hi=H+nv*rtk->nx;
                     for (k=0;k<rtk->nx;k++) Hi[k]=0.0;
                 }
 
-                v[nv]=y[f+i*nf*2]-y[f+j*nf*2]; /* single differenced residual */
+                /* single differenced residual */
+                if (refsatch<0) {
+                    v[nv]=      y[ch][f+i*nf*2]-y[ch][f+j*nf*2];
+                } else {
+                    v[nv]=y[refsatch][f+i*nf*2]-y[ch][f+j*nf*2];
+                }
 
                 if (H) { /* partial derivatives by rover position */
                     for (k=0;k<3;k++) Hi[k]=-e[k+i*3]+e[k+j*3];
@@ -797,14 +1009,19 @@ extern int ddres(rtk_t *rtk, const nav_t *nav, const double *x,
                 }
                 /* set valid data flags */
                 if (f<nf) rtk->ssat[sati-1].vsat[f]=rtk->ssat[satj-1].vsat[f]=1;
-                
+                if (f<nf) rtk->ssat[sati-1].vch[f]=rtk->ssat[satj-1].vch[f]=ch;
 
                 vflg[nv++] = (sati<<16)|(satj<<8)|((f<nf?0:1)<<4)|(f%nf);
                 nb[b]++;
+                
+                if (ch == 0) ch_sig_cnt[0]++;
+                else ch_sig_cnt[1]++;
             }
             b++;
         }
     } /* end of system loop */
+    
+    trace_slct_ch(rtk,obs,n,order,pch,samefac,2);
     
     /* measurement error covariance */
     ddcov(nb,b,Ri,Rj,nv,R);
@@ -1152,6 +1369,7 @@ static void resetfilterflag(nav_t *nav)
     nav->filreset = FALSE;
     clearsatcorr();
 }
+
 /* precise positioning ---------------------------------------------------------
 * input observation data and navigation message, compute rover position by
 * precise positioning
@@ -1216,30 +1434,32 @@ extern void ppp_rtk_pos(rtk_t *rtk, const obsd_t *obs, int n, nav_t *nav)
     static gtime_t regularly = {-1, 0.0};
     prcopt_t *opt=&rtk->opt;
     static grid_t grid;
-    double *rs,*dts,*var,*y,*e,*v,*azel,*H,*R,*xp,*Pp,*Qp,*xa,*bias;
+    double *v,*H,*R,*Pp,*Qp,*bias,*xp,*xa,*azel,*e;
+    double *y[SSR_CH_NUM],*rs[SSR_CH_NUM],*dts[SSR_CH_NUM],*var[SSR_CH_NUM],*pbslip[SSR_CH_NUM]={0};
     double el[MAXSAT];
-    int i,j,k=0,l,f,nv,info,nf=rtk->opt.nf,sati;
+    int i,j,k=0,l,f,nv,nvtmp[2],info,nf=rtk->opt.nf,sati,ch,pch=0,ret;
     int stat = (rtk->opt.mode <= PMODE_DGPS) ? SOLQ_DGPS : SOLQ_FLOAT;
-    int vflg[MAXOBS*NFREQ*4+1],svh[MAXOBS],nb,isat[MAXSAT];
+    int vflg[MAXOBS*NFREQ*4+1],svh[SSR_CH_NUM][MAXOBS],nb,isat[MAXSAT];
     float age;
-    static double cpc[MAXSAT*NFREQ]={0};
-    static gtime_t pt0[MAXSAT]={0};
-    double cpc_[MAXSAT*NFREQ],dist;
-    gtime_t pt0_[MAXSAT];
-    static int resetcnt=0,retrycnt=-1000,cntdiffp=0,np;
+    static double cpc[SSR_CH_NUM][MAXSAT*NFREQ]={0};
+    static gtime_t pt0[SSR_CH_NUM][MAXSAT]={0};
+    double cpc_[SSR_CH_NUM][MAXSAT*NFREQ],dist;
+    gtime_t pt0_[SSR_CH_NUM][MAXSAT];
+    static int resetcnt=0,cntdiffp=0,np;
     double pdop;
     static int backup = FALSE;
     double pos[3];
-    gtime_t temp;
     int nn;
 
-    trace(2,"ppp_rtk_pos   : time=%s nx=%d n=%d filreset=%d prevstat=%d\n",time_str(obs[0].time,0),rtk->nx,n,nav->filreset,rtk->sol.pstat);
+    trace(2,"ppp_rtk_pos   : time=%s nx=%d n=%d filreset=%d\n",time_str(obs[0].time,0),rtk->nx,n,nav->filreset);
 
-    rs=mat(6,n); dts=mat(2,n); var=mat(1,n); azel=zeros(2,n);
+    azel=zeros(2,n); e=mat(n,3);
 
     nv=n*nf*2*3;
 
-    y = mat(nv,1); e = mat(n,3);
+    for (ch=0;ch<(opt->l6mrg?SSR_CH_NUM:1);ch++) {
+        y[ch] = zeros(nv,1); rs[ch]=mat(6,n); dts[ch]=mat(2,n); var[ch]=mat(1,n);
+    }
 
     for (i=0;i<MAXSAT;i++) {
         rtk->ssat[i].sys = satsys(i+1,NULL);
@@ -1253,105 +1473,104 @@ extern void ppp_rtk_pos(rtk_t *rtk, const obsd_t *obs, int n, nav_t *nav)
     if (rtk->tt>opt->maxobsloss) {
         for (i=0;i<rtk->nx;i++) rtk->x[i]=0.0;
     }
+
+    regularly = (regularly.time == -1 ? obs[0].time: regularly);
+    if (opt->regularly != 0 && timediff(obs[0].time, regularly) >= (double)opt->regularly) {
+        trace(1, "ppp_rtk_pos(): regularly reset filter, tow=%.1f, network=%d\n", time2gpst(obs[0].time, NULL), grid.network);
+        for (i=0;i<rtk->nx;i++) rtk->x[i]=0.0;
+        rtk->sol.stat=SOLQ_SINGLE;
+        regularly = obs[0].time;
+        resetfilterflag(nav);
+        clear_current_cssr();
+        resetcnt=0;
+        free(azel); free(e);
+        for (ch=0;ch<(opt->l6mrg?SSR_CH_NUM:1);ch++) {
+            free(y[ch]) ; free(rs[ch]); free(dts[ch]); free(var[ch]);
+        }
+        return;
+    }
     
+    if (nav->filreset == TRUE) {
+        trace(1, "ppp_rtk_pos(): reset filter, tow=%.1f, network=%d\n", time2gpst(obs[0].time, NULL), grid.network);
+        if (rtk->opt.dynamics) {
+            for (i=0;i<rtk->nx;i++) rtk->x[i]=0.0;
+        } else {
+            for (i=NP(opt);i<rtk->nx;i++) rtk->x[i]=0.0;
+        }
+        rtk->sol.stat=SOLQ_FLOAT;
+        resetfilterflag(nav);
+        stat = SOLQ_FLOAT;
+        resetcnt=0;
+    }
+    
+    if (nav->ionoreset == TRUE) {
+        trace(2, "ppp_rtk_pos(): change grid, tow=%.1f, network=%d\n", time2gpst(obs[0].time, NULL), grid.network);
+        for (i = 1; i <= MAXSAT; ++i) {
+            rtk->x[II(i,opt)] = 0.0;
+        }
+        nav->ionoreset = FALSE;
+    }
+    ++resetcnt;
+
     /* temporal update of states */
     udstate_ppp(rtk,obs,n,nav);
 
     grid.network = opt->netnum;
     ecef2pos(rtk->x, pos);
-    if ((nn = get_grid_index(nav, pos, &grid, opt, obs[0].time, FALSE)) == 0) {
-        if (backup == FALSE || timediff(obs[0].time, (temp = GetBackupCSSRTime())) > 180.0) {
-            free(rs); free(dts); free(var); free(y); free(e); free(azel);
+    if ((nn = get_grid_index(nav, pos, &grid, opt, obs[0].time)) > 0) {
+        if (get_close_cssr(obs[0].time, grid.network, opt->l6mrg) == FALSE) {
+            if (backup == FALSE || (ret=is_valid_cssr_backup(obs[0].time, opt->l6mrg)) == FALSE) {
+                free(azel); free(e);
+                for (ch=0;ch<(opt->l6mrg?SSR_CH_NUM:1);ch++) {
+                    free(y[ch]) ;  free(rs[ch]); free(dts[ch]); free(var[ch]);
+                }
+                rtk->sol.stat = SOLQ_SINGLE;
+                return;
+            } else {
+                restore_current_cssr(obs[0].time, &grid, opt->l6mrg);
+            }
+        } else {
+            backup_current_cssr(&grid, opt->l6mrg);
+            backup = TRUE;
+        }
+    } else {
+        if (backup == FALSE || is_valid_cssr_backup(obs[0].time, opt->l6mrg) == FALSE) {
+            free(azel); free(e);
+            for (ch=0;ch<(opt->l6mrg?SSR_CH_NUM:1);ch++) {
+                free(y[ch]) ;  free(rs[ch]); free(dts[ch]); free(var[ch]);
+            }
             rtk->sol.stat = SOLQ_SINGLE;
             return;
         } else {
-            trace(3, "use backup CSSR data: obs=%.1f, CSSR=%.1f, age=%.1f\n",
-                time2gpst(obs[0].time, NULL), time2gpst(temp, NULL),
-                timediff(obs[0].time, temp));
-            RestoreCurrentCSSR(&grid);
+            restore_current_cssr(obs[0].time, &grid, opt->l6mrg);
         }
-    } else {
-        if (GetCloseCSSR(obs[0].time, grid.network) == FALSE) {
-            free(rs); free(dts); free(var); free(y); free(e); free(azel);
-            rtk->sol.stat = SOLQ_SINGLE;
-            return;
-        }
-        BackupCurrentCSSR(&grid);
-        backup = TRUE;
     }
-    
-    nav->facility = GetCurrentCSSRFacility();
-    nav->ssrtime = GetCurrentCSSRTime();
-    CheckCSSRFacility(nav, grid.network);
-    
-    if (opt->posopt[11] != 0) {
-        if (!opt->posopt[9] && IsSISAdjust()) {
-            rtk->sisadjust = 1;
-        } else {
-            rtk->sisadjust = 0;
-        }
-    } else {
-        rtk->sisadjust = IsSISAdjust();
-    }
-    for (i = 0; i < MAXSAT; ++i) {
-        UpdateGlobalCSSR(&nav->ssr[i], i + 1);
-    }
-    UpdateLocalCSSR(nav);
 
-    
-    regularly = (regularly.time == -1 ? obs[0].time: regularly);
-    if (opt->regularly != 0 && timediff(obs[0].time, regularly) >= (double)opt->regularly) {
-        double tow = time2gpst(timeget(), NULL);
-        trace(1, "ppp_rtk_pos(): reset filter, tow=%.2f, network=%d\n", tow, rtk->opt.netnum);
-        for (i=NP(opt);i<rtk->nx;i++) rtk->x[i]=0.0;
-        regularly = obs[0].time;
-        resetfilterflag(nav);
-        stat = SOLQ_NONE;
-        rtk->sol.stat=SOLQ_SINGLE;
-        ClearCurrentCSSR();
-        retrycnt=opt->retrycnt;
-        resetcnt=0;
-        udstate_ppp(rtk,obs,n,nav);
-        free(rs); free(dts); free(var); free(y); free(e); free(azel);
-        return;
-    }
-    if (nav->filreset == TRUE ||
-        (opt->epochtoretry>0&&retrycnt>0&&rtk->sol.pstat!=1&&resetcnt==opt->epochtoretry)) {
-        double tow = time2gpst(timeget(), NULL);
-        trace(1, "ppp_rtk_pos(): reset filter, tow=%.2f, network=%d, filreset=%d\n", tow, rtk->opt.netnum, nav->filreset);
-        for (i=NP(opt);i<rtk->nx;i++) rtk->x[i]=0.0;
-        resetfilterflag(nav);
-        stat = SOLQ_FLOAT;
-        rtk->sol.stat=SOLQ_FLOAT;
-        if (nav->filreset == TRUE) {
-            retrycnt=opt->retrycnt;
-        } else {
-            --retrycnt;
+    check_cssr_facility(nav, grid.network, opt->l6mrg);
+
+    for (ch=0;ch<(opt->l6mrg?SSR_CH_NUM:1);ch++) {
+        for (i = 0; i < MAXSAT; ++i) {
+            update_global_cssr(&nav->ssr_ch[ch][i], i + 1, ch);
         }
-        resetcnt=0;
-        udstate_ppp(rtk,obs,n,nav);
     }
-    
-    if (nav->ionoreset == TRUE) {
-        trace(2, "change select network or grid: tow=%.1f\n", time2gpst(obs[0].time, NULL));
-        for (i = 1; i <= MAXSAT; ++i) {
-            rtk->x[II(i,opt)] = 0.0;
-        }
-        udstate_ppp(rtk, obs, n, nav);
-        nav->ionoreset = FALSE;
-    }
-    ++resetcnt;
+    update_local_cssr(nav, opt->l6mrg);
+
     trace(4,"x(0)="); tracemat(4,rtk->x,1,NR(opt),13,4);
 
     /* satellite positions and clocks */
     saveposition(rtk->x);
-    satposs(obs[0].time,obs,n,nav,rtk->opt.sateph,rs,dts,var,svh);
-    for (i=0;i<MAXSAT;i++) {
-        satpos_ssr_sis(obs[0].time,obs[0].time,i+1,rtk,nav);
+    for (ch=0; ch<(opt->l6mrg?SSR_CH_NUM:1); ch++) {
+        set_cssr_ch_idx(ch);
+        satposs(obs[0].time,obs,n,nav,rtk->opt.sateph,rs[ch],dts[ch],var[ch],svh[ch]);
+        for (i=0;i<MAXSAT;i++) {
+            satpos_ssr_sis(obs[0].time,obs[0].time,i+1,rtk,nav,ch);
+        }
     }
 
-    xp=mat(rtk->nx,1); Pp=zeros(rtk->nx,rtk->nx); xa = mat(rtk->nx,1);
-    Qp=zeros(rtk->nx,rtk->nx);
+    xp=mat(rtk->nx,1); Pp=zeros(rtk->nx,rtk->nx); xa=mat(rtk->nx,1); Qp=zeros(rtk->nx,rtk->nx);
+    for (ch=0;ch<(opt->l6mrg?SSR_CH_NUM:1);ch++) {
+        pbslip[ch]=zeros(rtk->nx,1);
+    }
     
     matcpy(xp,rtk->x,rtk->nx,1);
 
@@ -1360,11 +1579,18 @@ extern void ppp_rtk_pos(rtk_t *rtk, const obsd_t *obs, int n, nav_t *nav)
 
     for (i=0;i<rtk->opt.niter;i++) {
         for (k=0;k<MAXREF;k++) {
-            for (l=0;l<MAXSAT;l++) {
-                pt0_[l]=pt0[l];
-                for (f=0;f<NFREQ;f++) cpc_[l*NFREQ+f]=cpc[l*NFREQ+f];
+            for (ch=0; ch<SSR_CH_NUM; ch++) nvtmp[ch]=0; 
+            for (ch=0; ch<(opt->l6mrg?SSR_CH_NUM:1); ch++) {
+                for (l=0;l<MAXSAT;l++) {
+                    pt0_[ch][l]=pt0[ch][l];
+                    for (f=0;f<NFREQ;f++) cpc_[ch][l*NFREQ+f]=cpc[ch][l*NFREQ+f];
+                }
+                nav_ssr_copy(nav, ch);
+                for (l=0;l<3;l++) pbslip[ch][l]=xp[l];
+                nvtmp[ch]=zdres(obs,n,rs[ch],dts[ch],var[ch],svh[ch],nav,pbslip[ch],y[ch],e,azel,rtk,TRUE,cpc_[ch],pt0_[ch],&grid,rtk->ssat,&rtk->opt,&rtk->sol,NULL,ch);
+                if (ch!=0 && opt->l6mrg) { pch=nvtmp[0]>=nvtmp[1]?0:1; } /* select priority ch */
             }
-            nv=zdres(obs,n,rs,dts,var,svh,nav,xp,y,e,azel,rtk,TRUE,cpc_,pt0_,&grid,rtk->ssat,&rtk->opt,&rtk->sol,NULL);
+            for (ch=0,nv=0; ch<SSR_CH_NUM; ch++) nv+=nvtmp[ch];
             /* trop estimation params is set to be zero when trop ssr is valid */
             if ((resetcnt==1)&&rtk->opt.tropopt>=TROPOPT_EST&&nav->invtrop==0) {
                 j=ITT(&rtk->opt);
@@ -1380,26 +1606,34 @@ extern void ppp_rtk_pos(rtk_t *rtk, const obsd_t *obs, int n, nav_t *nav)
                 break;
             }
             /* double-differenced residuals and partial derivatives */
-            if ((nv = ddres(rtk,nav,xp,Pp,obs,y,e,azel,n,v,H,R,vflg,k))<=0) {
+            if ((nv = ddres(rtk,nav,xp,pbslip,Pp,obs,y,e,azel,n,v,H,R,vflg,k,pch,FST))<=0) {
                 trace(2,"no double-differenced residual\n");
                 stat=SOLQ_NONE;
                 break;
             }
             /* Kalman filter measurement update */
             matcpy(Pp,rtk->P,rtk->nx,rtk->nx);
+            matcpy(xp,rtk->x,rtk->nx,1);
             if ((info=filter2(rtk,xp,Pp,Qp,H,v,R,rtk->nx,nv,vflg,0))!=0) {
                 trace(2,"ppp-rtk filter error %s info=%d\n",time_str(rtk->sol.time,0),info);
+                if (i==(rtk->opt.niter-1) && k==(MAXREF-1)) stat=SOLQ_NONE;
                 continue;
             }
-            /* postfit residuals of float solution */
-            if (zdres(obs,n,rs,dts,var,svh,nav,xp,y,e,azel,rtk,FALSE,cpc_,pt0_,&grid,rtk->ssat,&rtk->opt,&rtk->sol,NULL)) {
-                nv = ddres(rtk,nav,xp,Pp,obs,y,e,azel,n,v,NULL,R,vflg,k);
+            for (ch=0; ch<SSR_CH_NUM; ch++) nvtmp[ch]=0; 
+            for (ch=0; ch<(opt->l6mrg?SSR_CH_NUM:1); ch++) {
+                nav_ssr_copy(nav, ch);
+                nvtmp[ch]=zdres(obs,n,rs[ch],dts[ch],var[ch],svh[ch],nav,xp,y[ch],e,azel,rtk,FALSE,cpc_[ch],pt0_[ch],&grid,rtk->ssat,&rtk->opt,&rtk->sol,NULL,ch);
+                if (ch!=0 && opt->l6mrg) { pch=nvtmp[0]>=nvtmp[1]?0:1; } /* select priority ch */
+            }
+            for (ch=0,nv=0; ch<SSR_CH_NUM; ch++) nv+=nvtmp[ch]; 
+            if (nv) {
+                nv = ddres(rtk,nav,xp,NULL,Pp,obs,y,e,azel,n,v,NULL,R,vflg,k,pch,SND);
                 /* validation of float solution */
                 filter2(rtk,xp,Pp,NULL,H,v,R,rtk->nx,nv,vflg,1);
                 if (rtk->sol.chisq<100.0) break;
             }
             matcpy(xp,rtk->x,rtk->nx,1);
-            if (k==(MAXREF-1)) {
+            if (i==(rtk->opt.niter-1) && k==(MAXREF-1)) {
                 stat=SOLQ_NONE;
                 trace(2,"measurement update failed \n");
             }
@@ -1408,10 +1642,12 @@ extern void ppp_rtk_pos(rtk_t *rtk, const obsd_t *obs, int n, nav_t *nav)
 
     /* ssr age */
     rtk->sol.age=1e4;
-    for (i=0;i<n&&i<MAXOBS;i++) {
-        sati = obs[i].sat;
-        age=timediff(obs[i].time,nav->ssr[sati-1].t0[1]);
-        if (rtk->sol.age>age) rtk->sol.age=age;
+    for (ch=0; ch<(opt->l6mrg?SSR_CH_NUM:1); ch++) {
+        for (i=0;i<n&&i<MAXOBS;i++) {
+            sati = obs[i].sat;
+            age=timediff(obs[i].time,nav->ssr_ch[ch][sati-1].t0[1]);
+            if (rtk->sol.age>age) rtk->sol.age=age;
+        }
     }
 
     /* update process noise of ionoshepre delay */
@@ -1432,6 +1668,7 @@ extern void ppp_rtk_pos(rtk_t *rtk, const obsd_t *obs, int n, nav_t *nav)
     }
     
     if (stat!=SOLQ_NONE) {
+        char outstr[512]={0,},buffer[16]={0,};
         /* upate state and covariance matrix */
         matcpy(rtk->x, xp, rtk->nx, 1);
         matcpy(rtk->P, Pp, rtk->nx, rtk->nx);
@@ -1443,9 +1680,13 @@ extern void ppp_rtk_pos(rtk_t *rtk, const obsd_t *obs, int n, nav_t *nav)
                 if (!rtk->ssat[sati-1].vsat[f]) continue;
                 rtk->ssat[sati-1].lock[f]++;
                 rtk->ssat[sati-1].outc[f]=0;
-                if (f==0) rtk->sol.ns++; /* valid satellite count by L1 */
+                if (f==0) {
+                    rtk->sol.ns++; /* valid satellite count by L1 */
+                    sprintf(buffer, " %d,",sati); strcat(outstr, buffer);
+                }
             }
         }
+        trace(5, "valid sat(L1=%d) %s\n", rtk->sol.ns, outstr);
         /* lack of valid satellites */
         if (rtk->sol.ns<4) {
             trace(2,"lack of valid satellites.\n");
@@ -1466,6 +1707,7 @@ extern void ppp_rtk_pos(rtk_t *rtk, const obsd_t *obs, int n, nav_t *nav)
             double ratio=0.0;
             elsort(rtk,obs,isat,el,n);
             for (l=0;l<rtk->opt.armaxdelsat;l++) {
+                ratio=0.0;
                 for (i=0;i<n;i++) {
                     sati = isat[i];
                     if (el[i]<=rtk->opt.elmaskar) continue;
@@ -1497,9 +1739,20 @@ extern void ppp_rtk_pos(rtk_t *rtk, const obsd_t *obs, int n, nav_t *nav)
             }
         }
         
-        if (nb>1&&zdres(obs,n,rs,dts,var,svh,nav,xa,y,e,azel,rtk,FALSE,cpc_,pt0_,&grid,rtk->ssat,&rtk->opt,&rtk->sol,NULL)) {
+        if (nb>1) {
+            for (ch=0; ch<SSR_CH_NUM; ch++) nvtmp[ch]=0; 
+            for (ch=0; ch<(opt->l6mrg?SSR_CH_NUM:1); ch++) {
+                nav_ssr_copy(nav, ch);
+                nvtmp[ch]=zdres(obs,n,rs[ch],dts[ch],var[ch],svh[ch],nav,xa,y[ch],e,azel,rtk,FALSE,cpc_[ch],pt0_[ch],&grid,rtk->ssat,&rtk->opt,&rtk->sol,NULL,ch);
+                if (ch!=0 && opt->l6mrg) { pch=nvtmp[0]>=nvtmp[1]?0:1; } /* select priority ch */
+            }
+            for (ch=0,nv=0; ch<SSR_CH_NUM; ch++) nv+=nvtmp[ch];
+        } else {
+            nv=0;
+        }         
+        if (nv) {
             /* post-fix residuals for fixed solution */
-            nv = ddres(rtk,nav,xa,NULL,obs,y,e,azel,n,v,NULL,R,vflg,k);
+            nv = ddres(rtk,nav,xa,NULL,NULL,obs,y,e,azel,n,v,NULL,R,vflg,k,pch,TRD);
             /* validation of fixed solution */
             filter2(rtk,xp,Pp,NULL,H,v,R,rtk->nx,nv,vflg,2);
             
@@ -1511,8 +1764,8 @@ extern void ppp_rtk_pos(rtk_t *rtk, const obsd_t *obs, int n, nav_t *nav)
                     (rtk->opt.maxpdophold==0.0||pdop<=rtk->opt.maxpdophold)) {
                     holdamb(rtk,xa);
                 }
-           }
-           if (rtk->sol.chisq<opt->maxinno[4]) stat = SOLQ_FIX;
+            }
+            if (rtk->sol.chisq<opt->maxinno[4]) stat = SOLQ_FIX;
         }
     }
     
@@ -1578,19 +1831,27 @@ extern void ppp_rtk_pos(rtk_t *rtk, const obsd_t *obs, int n, nav_t *nav)
     else rtk->sol.stat=SOLQ_SINGLE;
 
     if (stat==SOLQ_NONE) {
-        for (i=0;i<rtk->nx;i++) rtk->x[i]=0.0;
+        if (rtk->opt.dynamics) {
+            for (i=0;i<rtk->nx;i++) rtk->x[i]=0.0;
+        } else {
+            for (i=NP(opt);i<rtk->nx;i++) rtk->x[i]=0.0;
+        }
     }
     
-    for (l=0;l<MAXSAT;l++) {
-        pt0[l]=pt0_[l];
-        for (f=0;f<NFREQ;f++) cpc[l*NFREQ+f]=cpc_[l*NFREQ+f];
+    for (ch=0; ch<(opt->l6mrg?SSR_CH_NUM:1); ch++) {
+        for (l=0;l<MAXSAT;l++) {
+            pt0[ch][l]=pt0_[ch][l];
+            for (f=0;f<NFREQ;f++) cpc[ch][l*NFREQ+f]=cpc_[ch][l*NFREQ+f];
+        }
     }
     
-    rtk->sol.pstat=stat;
     dops(n,azel,opt->elmin,rtk->sol.dop); /* {GDOP,PDOP,HDOP,VDOP} */
 
-    free(rs); free(dts); free(var); free(y) ; free(e); free(azel);
+    free(azel); free(e);
     free(xp); free(Pp); free(xa); free(v); free(H); free(R); free(bias);
     free(Qp);
+    for (ch=0; ch<(opt->l6mrg?SSR_CH_NUM:1); ch++) {
+        free(y[ch]) ;  free(rs[ch]); free(dts[ch]); free(var[ch]);
+    }
 }
 #endif /* CSSR2OSR_VRS */
